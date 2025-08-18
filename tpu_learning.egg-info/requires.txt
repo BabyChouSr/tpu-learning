@@ -1,0 +1,5 @@
+haliax
+jax
+equinox
+pytest
+torch

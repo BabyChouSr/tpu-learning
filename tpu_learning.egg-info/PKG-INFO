@@ -1,0 +1,11 @@
+Metadata-Version: 2.4
+Name: tpu-learning
+Version: 0.1.0
+Summary: Playground for learning about TPUs
+Author: Christopher Chou
+Requires-Python: >=3.10
+Requires-Dist: haliax
+Requires-Dist: jax
+Requires-Dist: equinox
+Requires-Dist: pytest
+Requires-Dist: torch

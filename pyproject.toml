@@ -1,0 +1,18 @@
+[project]
+name = "tpu-learning"
+version = "0.1.0"
+description = "Playground for learning about TPUs"
+authors = [{ name = "Christopher Chou" }]
+requires-python = ">=3.10"
+dependencies = [
+  "haliax>=1.4.dev403",
+  "jax",
+  "equinox",
+  "pytest",
+  "torch",
+  "marin",
+  "ray>=2.45.0",
+]
+
+[tool.uv.sources]
+marin = { path = "../marin", editable = true }
