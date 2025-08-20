@@ -2,6 +2,7 @@ import ray
 import numpy as np
 from flax import nnx
 import jax
+import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 class ColumnParallelLinear(nnx.Module):
