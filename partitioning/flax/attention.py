@@ -18,7 +18,7 @@ class MegatronAttention(nnx.Module):
         self.num_heads = num_heads
         self.head_dim = head_dim
 
-    def __call__(self, x):
+    def __call__(self, x, mask):
         # [B, S, D] -> [B, S, 3D_X]
         with TraceAnnotation("qkv chunk"):
             qkv = self.wqkv(x)
@@ -35,6 +35,7 @@ class MegatronAttention(nnx.Module):
         # Use q, k as a placeholder for the position of query and key
         with TraceAnnotation("qk matmul"):
             scores = jnp.einsum('bhqd,bhdk->bhqk', q, k) / jnp.sqrt(self.head_dim)
+            scores = scores -1e9 * (1.0 - mask)
         
         with TraceAnnotation("softmax"):
             scores = jax.nn.softmax(scores, axis=-1)
@@ -59,7 +60,7 @@ class GroupedQueryAttention(nnx.Module):
         self.num_head_groups = num_heads // num_kv_heads
         self.head_dim = head_dim
     
-    def __call__(self, x):
+    def __call__(self, x, mask):
         # [b, s, d] -> [b, s,]
         q, k, v = self.wq(x), self.wk(x), self.wv(x)
         
@@ -75,6 +76,7 @@ class GroupedQueryAttention(nnx.Module):
         # Omit the g in the output will sum across that dimension. This means that for each kv head
         # we sum across the group of query heads.
         scores = jnp.einsum("b g h q d,b h d k->b h q k", q, k) / jnp.sqrt(self.head_dim)
+        scores = scores - 1e9 * (1.0 - mask)
         scores = jax.nn.softmax(scores, axis=-1)
         values = jnp.einsum("bhqk,bhkd->bhqd", scores, v)
         values = rearrange(values, "b h q d->b q (h d)", h=self.num_kv_heads)
@@ -101,32 +103,37 @@ def megatron_attention_parallelism():
 
     hidden_dim = 1024
     num_heads = 8
+    seq_len = 16
     head_dim = hidden_dim // num_heads
-    with jax.profiler.trace('/tmp/jax-trace', create_perfetto_link=True, create_perfetto_trace=True):
-        with mesh:
-            attention = create_sharded_attention(hidden_dim, head_dim, num_heads, "gqa")
-            x = jax.random.normal(jax.random.PRNGKey(0), (1, 16, hidden_dim))
-            # Compile the forward with pjit and print compiler IR text
-            def forward(inp):
-                return attention(inp)
+    causal_mask = jnp.arange(seq_len)[:, None] >= jnp.arange(seq_len)[None, :]
+    # with jax.profiler.trace('/tmp/jax-trace', create_perfetto_link=True, create_perfetto_trace=True):
+    with mesh:
+        attention = create_sharded_attention(hidden_dim, head_dim, num_heads, "gqa")
+        x = jax.random.normal(jax.random.PRNGKey(0), (1, seq_len, hidden_dim))
+        # Compile the forward with pjit and print compiler IR text
+        def forward(inp, mask):
+            return attention(inp, mask)
 
-            forward_pjit = pjit.pjit(
-                forward,
-                in_shardings=NamedSharding(mesh, P(None, None, None)),
-                out_shardings=NamedSharding(mesh, P(None, None, None)),
-            )
+        forward_pjit = pjit.pjit(
+            forward,
+            in_shardings=(
+                NamedSharding(mesh, P(None, None, None)),
+                NamedSharding(mesh, P(None, None)),
+            ),
+            out_shardings=NamedSharding(mesh, P(None, None, None)),
+        )
 
-            # lowered = forward_pjit.lower(x)
-            print(forward_pjit.lower(x).compile().as_text())
+        # lowered = forward_pjit.lower(x)
+        print(forward_pjit.lower(x, causal_mask).compile().as_text())
 
-            # NOTE(chris): Actually, using the forward_pjit does not lead to 
-            # a very informational trace. Seems like need to use the eager version of it
-            # We do see the all-reduce at the end of the out_proj trace which is what we want
-            # Execute once after compilation
-            # y = forward_pjit(x)
-            y = attention(x)
-            # print(y.shape)
-            y.block_until_ready()
+        # NOTE(chris): Actually, using the forward_pjit does not lead to 
+        # a very informational trace. Seems like need to use the eager version of it
+        # We do see the all-reduce at the end of the out_proj trace which is what we want
+        # Execute once after compilation
+        # y = forward_pjit(x)
+        y = attention(x, causal_mask)
+        # print(y.shape)
+        # y.block_until_ready()
 
         # non_sharded_y = non_sharded_attention(x)
         # assert jnp.allclose(y, non_sharded_y), f"Not close, tensor parallel: {y}, normal: {non_sharded_y}"
