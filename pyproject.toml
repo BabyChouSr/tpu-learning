@@ -10,8 +10,8 @@ dependencies = [
   "equinox",
   "pytest",
   "torch",
-  "marin",
   "ray>=2.45.0",
+  "einops>=0.8.1",
 ]
 
 [tool.uv.sources]
