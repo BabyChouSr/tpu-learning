@@ -23,41 +23,100 @@ def gather_topk(all_outputs, expert_indices):
 
     return gather_all(all_outputs, expert_indices)                   # [B, S, K, D]
 
+# If we were to just multiply using all of the experts
+class GShardMoE(nnx.Module):
+	def __init__(self, hidden_dim, intermediate_dim, num_experts, top_k, rngs):
+		self.gate = nnx.Linear(hidden_dim, num_experts, rngs=rngs)
+		self.shared_experts = MLP(hidden_dim, intermediate_dim, rngs)
+		self.experts = [MLP(hidden_dim, intermediate_dim, rngs) for _ in range(num_experts)]
+		self.top_k = top_k
+		self.num_experts = num_experts
+		
+	def __call__(self, x):
+		# x: [B, S, D]
+		B, S, D = x.shape
+		# Router: probabilities per expert
+		router_probs = jax.nn.softmax(self.gate(x), axis=-1)  # [B, S, E]
+		# Top-k per token
+		expert_values, expert_indices = jax.lax.top_k(router_probs, k=self.top_k)  # [B, S, K]
+		expert_values = expert_values / (jnp.sum(expert_values, axis=-1, keepdims=True) + 1e-9)
+		# Compute all experts on all tokens (no capacity limit): [B, S, E, D]
+		all_outputs = jnp.stack([expert(x) for expert in self.experts], axis=2)
+		# Build per-expert weights and combine
+		one_hot = jax.nn.one_hot(expert_indices, self.num_experts)  # [B, S, K, E]
+		weights_E = (one_hot * expert_values[..., None]).sum(axis=2)  # [B, S, E]
+		moe_out = jnp.einsum('b s e, b s e d -> b s d', weights_E, all_outputs)  # [B, S, D]
+		return x + self.shared_experts(x) + moe_out
+
+
 class DeepseekMoE(nnx.Module):
-    def __init__(self, hidden_dim, intermediate_dim, num_experts, top_k, rngs):
-        self.gate = nnx.Linear(hidden_dim, num_experts, rngs=rngs)
-        self.shared_experts = MLP(hidden_dim, intermediate_dim, rngs)
-        self.experts = [MLP(hidden_dim, intermediate_dim, rngs) for _ in range(num_experts)]
-        self.top_k = top_k
+	def __init__(self, hidden_dim, intermediate_dim, num_experts, top_k, rngs):
+		self.gate = nnx.Linear(hidden_dim, num_experts, rngs=rngs)
+		self.shared_experts = MLP(hidden_dim, intermediate_dim, rngs)
+		self.experts = [MLP(hidden_dim, intermediate_dim, rngs) for _ in range(num_experts)]
+		self.top_k = top_k
+		self.capacity_factor = 1.25
 
-    def __call__(self, x):
-        # gate = jax.nn.sigmoid()
-        # [b, s, d] -> [b, s, e]
-        router_logits = jax.nn.sigmoid(self.gate(x))
+	def __call__(self, x):
+		# x: [B, S, D]
+		B, S, D = x.shape
+		num_experts = len(self.experts)
+		K = self.top_k
+		N = B * S  # tokens
 
-        # [b, s, k]
-        expert_values, expert_indices = jax.lax.top_k(router_logits, k=self.top_k)
+		# Router and top-k selection per token
+		router_logits = self.gate(x)  # [B, S, E]
+		# Prefer softmax probabilities for stability before top_k
+		router_probs = jax.nn.softmax(router_logits, axis=-1)
+		expert_values, expert_indices = jax.lax.top_k(router_probs, k=K)  # [B, S, K]
+		expert_values = expert_values / (jnp.sum(expert_values, axis=-1, keepdims=True) + 1e-9)
 
-        # [b, s, 1]
-        expert_normalization = jnp.sum(expert_values, axis=-1, keepdims=True)
+		# Flatten tokens
+		x_tokens = x.reshape(N, D)                   # [N, D]
+		expert_indices_flat = expert_indices.reshape(N * K)  # [N*K]
+        # expert_values_flat is how much to weigh each expert
+		expert_values_flat = expert_values.reshape(N * K)    # [N*K]
 
-        # [b, s, k]
-        expert_values /= expert_normalization
+		# Capacity per expert: ceil(capacity_factor * average assignments per expert)
+		# average assignments per expert = (N*K)/E
+		C = int(jnp.ceil(self.capacity_factor * (N * K) / num_experts))
 
-        # [e, b, s, d]
-        # NOTE(chris): Certainly this can be more optimized with the usage of a kernel
-        # so that we can select the exact experts we want here.
-        all_outputs = jnp.stack([expert(x) for expert in self.experts], axis=2)
-        print(f"all outputs shape: {all_outputs.shape}")
+		# Compute per-pair position in expert via cumulative count over flattened pairs
+		oh_e = jax.nn.one_hot(expert_indices_flat, num_experts, dtype=x.dtype)  # [N*K, E]
+		cumsum_per_expert = jnp.cumsum(oh_e, axis=0)                           # [N*K, E]
+        
+        # Position of the token in the Expert's batch
+		positions_flat = (cumsum_per_expert * oh_e).sum(axis=1) - 1            # [N*K], 0-based
+          
+        # Check that the number of tokens is less than the capacity
+		within_capacity = positions_flat < C                                    # [N*K]
 
-        # [b, s, k, d]
-        selected_outputs = gather_topk(all_outputs, expert_indices)
-        print(f"selected outputs shape: {selected_outputs.shape}")
+		# Build dispatch tensor: [N, E, C]
+		oh_c = jax.nn.one_hot(jnp.clip(positions_flat, 0, C - 1), C, dtype=x.dtype)  # [N*K, C]
 
-        # [b, s, k, 1] * [b, s, k, d]
-        expert_weighted_outputs = (expert_values[..., None] * selected_outputs).sum(axis=2)
+        # For each token / number of experts, for each expert which capacity it takes up
+        # if more than capacity, gets masked by within_capacity tensor
+		pair_dispatch = (within_capacity.astype(x.dtype)[:, None, None] * oh_e[:, :, None] * oh_c[:, None, :])  # [N*K, E, C]
+		dispatch = pair_dispatch.reshape(N, K, num_experts, C).sum(axis=1)  # [N, E, C]
 
-        return x + self.shared_experts(x) + expert_weighted_outputs
+		# Expert inputs: [E, C, D]
+		expert_inputs = jnp.einsum('n e c, n d -> e c d', dispatch, x_tokens)
+
+		# Run experts batched per expert
+		expert_outputs = jnp.stack([self.experts[e](expert_inputs[e]) for e in range(num_experts)], axis=0)  # [E, C, D]
+
+		# Combine back to tokens with gate weights
+        # Gives us the weighted value of each token contribution
+		pair_combine = pair_dispatch * expert_values_flat[:, None, None]                 # [N*K, E, C]
+          
+        # Token contribution
+		combine = pair_combine.reshape(N, K, num_experts, C).sum(axis=1)                 # [N, E, C]
+          
+        # Expert-weighted token outputs
+		output_tokens = jnp.einsum('n e c, e c d -> n d', combine, expert_outputs)       # [N, D]
+
+		# Residual/shared path and reshape back
+		return x + self.shared_experts(x) + output_tokens.reshape(B, S, D)
     
 @nnx.jit
 def create_sharded_model():

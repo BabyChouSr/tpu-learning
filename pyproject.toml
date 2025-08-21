@@ -12,6 +12,7 @@ dependencies = [
   "torch",
   "ray>=2.45.0",
   "einops>=0.8.1",
+  "jupyter>=1.1.1",
 ]
 
 [tool.uv.sources]
