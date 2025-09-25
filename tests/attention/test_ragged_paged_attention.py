@@ -51,8 +51,9 @@ def test_ragged_paged_attention():
     kv_lens = kv_lens.at[2].set(2)
 
     # Cumulative query lengths (one query per sequence)
-    cu_q_lens = jnp.arange(_NUM_SEQS + 1, dtype=jnp.int32)
-    cu_q_lens = jnp.pad(cu_q_lens, (0, (_MAX_NUM_SEQS + 1) - len(cu_q_lens))) # pad with 0 before and x after
+    cu_q_lens = jnp.arange(_NUM_SEQS, dtype=jnp.int32)
+    
+    cu_q_lens = jnp.arange(_MAX_NUM_SEQS + 1, dtype=jnp.int32)
 
     attn_output = ragged_paged_attention(
         queries,
@@ -63,7 +64,7 @@ def test_ragged_paged_attention():
         _NUM_SEQS,
     )
 
-    # breakpoint()
+    breakpoint()
 
     num_seqs_array = jnp.array(_NUM_SEQS, dtype=jnp.int32).reshape(1,) # needed to conform to api
     ref_attn_output = ref_ragged_paged_attention(
