@@ -16,6 +16,9 @@ dependencies = [
   "pyarrow[parquet]>=21.0.0",
   "pydantic>=2.11.10",
   "fastapi[standard]>=0.118.0",
+  "watchdog>=6.0.0",
+  "flask>=3.1.2",
+  "ray[client]",
 ]
 
 [tool.uv.sources]
