@@ -16,6 +16,9 @@ dependencies = [
   "pyarrow[parquet]>=21.0.0",
   "pydantic>=2.11.10",
   "fastapi[standard]>=0.118.0",
+  "xprof>=2.20.6",
+  "protobuf>=6.31.0",
+  "matplotlib>=3.10.7",
 ]
 
 [tool.uv.sources]
