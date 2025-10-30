@@ -1,2 +1,2 @@
 edit1
-conflict
+edit2
